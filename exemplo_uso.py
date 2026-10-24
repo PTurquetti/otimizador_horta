@@ -58,12 +58,12 @@ resultado = gerar_cronograma(
     catalogo, 
     comprimento=2, 
     largura=5, 
-    n_subareas=3, 
+    n_subareas=8, 
     demanda=demanda,
     alpha=0.3, 
     beta=0.3, 
     gamma=0.3,
-    tempo_limite=480,
+    tempo_limite=1200,
 )
 
 imprimir(resultado)

@@ -38,7 +38,8 @@ CAMPOS_CATALOGO = (
     "produto",             # ex.: "Cenoura" (opcional: se faltar, é deduzido do nome)
     "familia",             # família botânica (regra de rotação)
     "janela_inicio",       # 1..12: primeiro mês em que pode ser plantada
-    "janela_fim",          # 1..12: último mês em que pode ser plantada (pode atravessar o ano)
+    "janela_fim",          # 1..12: último mês em que pode ser plantada (pode atravessar o ano;
+                           #        igual ao início = um único mês; ano inteiro = 1 a 12)
     "meses_ate_colheita",  # meses do plantio até a 1ª colheita
     "duracao_colheita",    # nº de meses com colheita (1 = colheita única)
     "meses_na_terra",      # meses que a cultura ocupa a subárea
@@ -116,8 +117,6 @@ class _Modelo:
     L: list
     area_sub: float
     x: dict
-    z: dict
-    zp: dict
     wf: dict
     cons: dict
     s_min: pulp.LpVariable
@@ -128,9 +127,9 @@ class _Modelo:
 
 
 def _meses_janela(inicio: int, fim: int) -> list:
-    if inicio == fim:          # convenção: início == fim significa ano inteiro
-        return list(T)
-    if inicio < fim:
+    """Meses de plantio permitidos, de 'inicio' a 'fim' (inclusive).
+    Início igual ao fim = um único mês. Ano inteiro deve ser informado como 1 a 12."""
+    if inicio <= fim:
         return list(range(inicio, fim + 1))
     return list(range(inicio, MESES + 1)) + list(range(1, fim + 1))   # atravessa a virada do ano
 
@@ -244,43 +243,34 @@ def _construir(d: _Dados, area_total: float, n_subareas: int, alpha: float, beta
     # x[i, j, l] = 1 se a variante i é plantada no mês j na subárea l (0 fora da janela de plantio)
     x = {(i, j, l): pulp.LpVariable(f"x_{i}_{j}_{l}", 0, 1 if j in d.janela[i] else 0, cat="Binary")
          for i in C for j in T for l in L}
-    # z[i, j] = 1 se a variante i é colhida no mês j;  zp[p, j]: idem por hortaliça;  wf[f, j]: por família
-    z = {(i, j): pulp.LpVariable(f"z_{i}_{j}", cat="Binary") for i in C for j in T}
-    zp = {(p, j): pulp.LpVariable(f"zp_{prod_idx[p]}_{j}", cat="Binary") for p in P for j in T}
+    # wf[f, j] = 1 se alguma cultura da família f é colhida no mês j (usada só no termo de variedade)
     wf = {(f, j): pulp.LpVariable(f"wf_{fam_idx[f]}_{j}", cat="Binary") for f in d.familias for j in T}
     # cons[p, j] = kg da hortaliça p consumidos no mês j;  s_min = fração da demanda (R$) no pior mês
     cons = {(p, j): pulp.LpVariable(f"cons_{prod_idx[p]}_{j}", lowBound=0) for p in P for j in T}
     s_min = pulp.LpVariable("s_min", lowBound=0, upBound=1)
 
-    # --- Colheita e produção por variante
-    producao = {}
+    # --- Colheita e produção por variante (expressões, não variáveis)
+    colheitas = {}   # colheitas[i, j] = nº de subáreas que colhem a variante i no mês j
+    producao = {}    # producao[i, j]  = kg da variante i colhidos no mês j
     for i in C:
         for j in T:
-            mps = _meses_plantio(var[i], j)
-            plantios = pulp.lpSum(x[i, mp, l] for mp in mps for l in L)
-            producao[i, j] = var[i]["prod_mes_kg_m2"] * A * plantios
-            prob += z[i, j] <= plantios, f"z_sup_{i}_{j}"
-            for mp in mps:
-                for l in L:
-                    prob += z[i, j] >= x[i, mp, l], f"z_inf_{i}_{j}_{mp}_{l}"
+            colheitas[i, j] = pulp.lpSum(x[i, mp, l] for mp in _meses_plantio(var[i], j) for l in L)
+            producao[i, j] = var[i]["prod_mes_kg_m2"] * A * colheitas[i, j]
 
     # --- Colheita e consumo por hortaliça (as variantes se somam)
     for p in P:
         k = prod_idx[p]
         for j in T:
-            prob += zp[p, j] <= pulp.lpSum(z[i, j] for i in d.variantes[p]), f"zp_sup_{k}_{j}"
-            for i in d.variantes[p]:
-                prob += zp[p, j] >= z[i, j], f"zp_inf_{k}_{i}_{j}"
             prob += cons[p, j] <= pulp.lpSum(producao[i, j] for i in d.variantes[p]), f"cons_prod_{k}_{j}"
             prob += cons[p, j] <= d.demanda[p], f"cons_dem_{k}_{j}"
 
-    # --- Famílias colhidas
+    # --- Famílias colhidas: wf só pode valer 1 se houver colheita da família no mês.
+    #     (Não é preciso forçar wf = 1 quando há colheita: o objetivo já premia wf.
+    #      Os relatórios calculam a variedade direto do plano.)
     for f in d.familias:
         da_familia = [i for i in C if var[i]["familia"] == f]
         for j in T:
-            prob += wf[f, j] <= pulp.lpSum(z[i, j] for i in da_familia), f"wf_sup_{fam_idx[f]}_{j}"
-            for i in da_familia:
-                prob += wf[f, j] >= z[i, j], f"wf_inf_{fam_idx[f]}_{i}_{j}"
+            prob += wf[f, j] <= pulp.lpSum(colheitas[i, j] for i in da_familia), f"wf_sup_{fam_idx[f]}_{j}"
 
     # --- Piso de atendimento mensal (max-min)
     for j in T:
@@ -307,14 +297,14 @@ def _construir(d: _Dados, area_total: float, n_subareas: int, alpha: float, beta
     valor_max = d.demanda_mes_rs * MESES
     div_max = len(d.familias) * MESES
     # valor de mercado de tudo o que é colhido; excedente = colhido - consumido (o que não é consumido se perde)
-    colhido_rs = pulp.lpSum(var[i]["preco_kg"] * producao[i, j] for i in C for j in T)
+    colhido_rs = pulp.lpSum(d.preco_produto[var[i]["produto"]] * producao[i, j] for i in C for j in T)
     excedente_rs = colhido_rs - consumo_total
     prob.setObjective(consumo_total * (1 / valor_max)              # consumo total do ano
                       + alpha * (1 / div_max) * div_total          # variedade: famílias colhidas
                       + beta * s_min                               # regularidade: atendimento do pior mês
                       - gamma * (1 / valor_max) * excedente_rs)    # desperdício: valor do excedente
 
-    return _Modelo(prob, L, A, x, z, zp, wf, cons, s_min, consumo_total, div_total, valor_max, div_max)
+    return _Modelo(prob, L, A, x, wf, cons, s_min, consumo_total, div_total, valor_max, div_max)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -413,25 +403,31 @@ def _extrair(d: _Dados, m: _Modelo) -> dict:
                          "produto": var[i]["produto"] if i is not None else None,
                          "fase": fase.get((l, j), "vazio")})
 
-    # consumo por hortaliça e mês
+    # consumo por hortaliça e mês, calculado a partir do plano (não das variáveis do solver):
+    # a família consome o que foi colhido, até a demanda do mês; o resto é excedente
     colhido = {(p, j): 0.0 for p in d.produtos for j in T}
-    for e in calendario:
-        if e["acao"] == "colher":
-            colhido[e["produto"], e["mes"]] += e["kg"]
+    familias_colhidas = set()
+    for i, j, l in plantios:
+        v = var[i]
+        for k in range(v["meses_ate_colheita"], v["meses_ate_colheita"] + v["duracao_colheita"]):
+            mm = (j - 1 + k) % MESES + 1
+            colhido[v["produto"], mm] += v["prod_mes_kg_m2"] * A
+            familias_colhidas.add((v["familia"], mm))
+    consumido = {(p, j): min(colhido[p, j], d.demanda[p]) for p in d.produtos for j in T}
     consumo = []
     for p in d.produtos:
         for j in T:
-            c = max(0.0, _v(m.cons[p, j]))
             consumo.append({"produto": p, "mes": j, "demanda_kg": d.demanda[p],
-                            "colhido_kg": round(colhido[p, j], 3), "consumido_kg": round(c, 3),
-                            "excedente_kg": round(max(0.0, colhido[p, j] - c), 3)})
+                            "colhido_kg": round(colhido[p, j], 3),
+                            "consumido_kg": round(consumido[p, j], 3),
+                            "excedente_kg": round(colhido[p, j] - consumido[p, j], 3)})
 
     # resumo anual por hortaliça (kg e R$)
     resumo = []
     for p in d.produtos:
         linhas = [c for c in consumo if c["produto"] == p]
-        col = sum(c["colhido_kg"] for c in linhas)
-        con = sum(c["consumido_kg"] for c in linhas)
+        col = sum(colhido[p, j] for j in T)
+        con = sum(consumido[p, j] for j in T)
         dem = d.demanda[p] * MESES
         resumo.append({"produto": p,
                        "demanda_anual_kg": round(dem, 3),
@@ -439,22 +435,22 @@ def _extrair(d: _Dados, m: _Modelo) -> dict:
                        "consumido_kg": round(con, 3),
                        "excedente_kg": round(max(0.0, col - con), 3),
                        "pct_demanda_atendida": round(100 * con / dem, 2),
-                       "meses_com_colheita": sum(1 for c in linhas if c["colhido_kg"] > 1e-6),
-                       # meses em que toda a demanda do mês foi coberta (tolerância de 1 g para arredondamento)
-                       "meses_demanda_atendida": sum(1 for c in linhas if c["consumido_kg"] >= d.demanda[p] - 1e-3),
+                       "meses_com_colheita": sum(1 for j in T if colhido[p, j] > 1e-9),
+                       # meses em que toda a demanda do mês foi coberta
+                       "meses_demanda_atendida": sum(1 for j in T if colhido[p, j] >= d.demanda[p] - 1e-9),
                        "valor_colhido_rs": round(col * d.preco_produto[p], 2),
                        "valor_consumido_rs": round(con * d.preco_produto[p], 2)})
-    colhido_total = sum(r["colhido_kg"] for r in resumo)
-    consumido_total = sum(r["consumido_kg"] for r in resumo)
-    excedente_total = sum(r["excedente_kg"] for r in resumo)
+    colhido_total = sum(colhido.values())
+    consumido_total = sum(consumido.values())
+    excedente_total = colhido_total - consumido_total
 
-    atendimento = {j: sum(d.preco_produto[p] * max(0.0, _v(m.cons[p, j])) for p in d.produtos) / d.demanda_mes_rs
-                   for j in T}
+    atendimento = {j: sum(d.preco_produto[p] * consumido[p, j] for p in d.produtos) / d.demanda_mes_rs for j in T}
     pior = min(atendimento, key=atendimento.get)
-    consumo_rs = sum(d.preco_produto[p] * max(0.0, _v(m.cons[p, j])) for p in d.produtos for j in T)
+    consumo_rs = sum(d.preco_produto[p] * consumido[p, j] for p in d.produtos for j in T)
+    excedente_rs = sum(d.preco_produto[p] * (colhido[p, j] - consumido[p, j]) for p in d.produtos for j in T)
     meses_ocupados = sum(1 for k in ocupante.values() if k is not None)
-    familias_mes = sum(_v(w) for w in m.wf.values()) / MESES
-    hortalicas_mes = sum(_v(w) for w in m.zp.values()) / MESES
+    familias_mes = len(familias_colhidas) / MESES
+    hortalicas_mes = sum(1 for p in d.produtos for j in T if colhido[p, j] > 1e-9) / MESES
 
     metricas = {
         "objetivo": pulp.value(m.prob.objective),
@@ -468,15 +464,14 @@ def _extrair(d: _Dados, m: _Modelo) -> dict:
         "consumido_total_kg": round(consumido_total, 2),
         "excedente_total_kg": round(excedente_total, 2),
         "pct_aproveitamento": round(100 * consumido_total / colhido_total, 1) if colhido_total else 0.0,
-        "valor_excedente_rs": round(sum(r["excedente_kg"] * d.preco_produto[r["produto"]] for r in resumo), 2),
-        "producao_bruta_rs": round(sum(var[i]["prod_mes_kg_m2"] * var[i]["duracao_colheita"] * var[i]["preco_kg"] * A
-                                       for i, _, _ in plantios), 2),
+        "valor_excedente_rs": round(excedente_rs, 2),
+        "producao_bruta_rs": round(consumo_rs + excedente_rs, 2),
         "pct_area_ocupada": round(100 * meses_ocupados / (len(m.L) * MESES), 1),
         "n_subareas": len(m.L),
         "area_subarea_m2": round(A, 4),
         "n_plantios": len(plantios),
     }
-    atendidos = {e["produto"] for e in consumo if e["consumido_kg"] > 1e-6}
+    atendidos = {p for p in d.produtos if any(colhido[p, j] > 1e-9 for j in T)}
     return {
         "metricas": metricas,
         "mapa": mapa,
